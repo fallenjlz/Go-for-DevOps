@@ -1,13 +1,15 @@
-package main
+package main // Define the package name
 
+// Import necessary packages
 import (
-	"context"
-	"log"
-	"net/http"
-	"os"
-	"strconv"
-	"time"
+	"context" // For managing request lifecycles
+	"log"     // Logging library
+	"net/http" // HTTP client and server implementations
+	"os" // Interacting with operating system functionality
+	"strconv" // String conversion utilities
+	"time" // Time manipulation functions
 
+	// OpenTelemetry packages for instrumentation and trace exporting
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -18,148 +20,145 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
-	"google.golang.org/grpc"
+	"go.uber.org/zap" // Structured logging package
+	"google.golang.org/grpc" // gRPC framework
 )
 
-// main sets up the trace providers and starts a loop to continuously call the server
+// main function to set up trace providers and start sending requests
 func main() {
-	shutdown := initTraceProvider()
-	defer shutdown()
+	shutdown := initTraceProvider() // Initialize the trace provider
+	defer shutdown() // Ensure clean shutdown of the trace provider
 
-	continuouslySendRequests()
+	continuouslySendRequests() // Start sending requests in a loop
 }
 
-// initTraceProvider initializes an OTLP exporter, and configures the corresponding trace provider.
+// Initializes OTLP exporter and trace provider
 func initTraceProvider() func() {
-	ctx := context.Background()
+	ctx := context.Background() // Create a new context
 
+	// Get OTLP endpoint from environment variable or use default
 	otelAgentAddr, ok := os.LookupEnv("OTEL_EXPORTER_OTLP_ENDPOINT")
 	if !ok {
 		otelAgentAddr = "0.0.0.0:4317"
 	}
 
-	closeTraces := initTracer(ctx, otelAgentAddr)
+	closeTraces := initTracer(ctx, otelAgentAddr) // Initialize the tracer
 
-	return func() {
-		doneCtx, cancel := context.WithTimeout(ctx, time.Second)
-		defer cancel()
-		// pushes any last exports to the receiver
-		closeTraces(doneCtx)
+	return func() { // Return a function to cleanly shutdown the trace exporter
+		doneCtx, cancel := context.WithTimeout(ctx, time.Second) // Create a context with timeout for shutdown
+		defer cancel() // Ensure the cancel function is called to release resources
+		closeTraces(doneCtx) // Close the trace exporter
 	}
 }
 
-// initTracer initializes an OTLP trace exporter and registers the trace provider with the global context
+// Initializes and registers a tracer with the global context
 func initTracer(ctx context.Context, otelAgentAddr string) func(context.Context) {
-	traceClient := otlptracegrpc.NewClient(
-		otlptracegrpc.WithInsecure(),
-		otlptracegrpc.WithEndpoint(otelAgentAddr),
-		otlptracegrpc.WithDialOption(grpc.WithBlock()))
-	traceExp, err := otlptrace.New(ctx, traceClient)
-	handleErr(err, "Failed to create the collector trace exporter")
+	traceClient := otlptracegrpc.NewClient( // Create a new OTLP gRPC client
+		otlptracegrpc.WithInsecure(), // Disable TLS for the connection
+		otlptracegrpc.WithEndpoint(otelAgentAddr), // Set the OTLP collector endpoint
+		otlptracegrpc.WithDialOption(grpc.WithBlock())) // Block until the connection is established
+	traceExp, err := otlptrace.New(ctx, traceClient) // Create a new OTLP trace exporter
+	handleErr(err, "Failed to create the collector trace exporter") // Handle potential initialization errors
 
+	// Create a new resource with service name and other attributes
 	res, err := resource.New(ctx,
-		resource.WithFromEnv(),
-		resource.WithProcess(),
-		resource.WithTelemetrySDK(),
-		resource.WithHost(),
+		resource.WithFromEnv(), // Pull resource attributes from the environment
+		resource.WithProcess(), // Include process information
+		resource.WithTelemetrySDK(), // Include telemetry SDK information
+		resource.WithHost(), // Include host information
 		resource.WithAttributes(
-			// the service name used to display traces in backends
-			semconv.ServiceNameKey.String("demo-client"),
+			semconv.ServiceNameKey.String("demo-client"), // Set the service name
 		),
 	)
-	handleErr(err, "failed to create resource")
+	handleErr(err, "failed to create resource") // Handle potential resource creation errors
 
-	bsp := sdktrace.NewBatchSpanProcessor(traceExp)
-	tracerProvider := sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithResource(res),
-		sdktrace.WithSpanProcessor(bsp),
+	bsp := sdktrace.NewBatchSpanProcessor(traceExp) // Create a new batch span processor
+	tracerProvider := sdktrace.NewTracerProvider( // Create a new tracer provider
+		sdktrace.WithSampler(sdktrace.AlwaysSample()), // Set the sampling strategy to always sample
+		sdktrace.WithResource(res), // Set the resource associated with this provider
+		sdktrace.WithSpanProcessor(bsp), // Register the span processor with the provider
 	)
 
-	// set global propagator to tracecontext (the default is no-op).
-	otel.SetTextMapPropagator(propagation.TraceContext{})
-	otel.SetTracerProvider(tracerProvider)
+	otel.SetTextMapPropagator(propagation.TraceContext{}) // Set the global propagator to tracecontext
+	otel.SetTracerProvider(tracerProvider) // Register the tracer provider with the OpenTelemetry API
 
-	return func(doneCtx context.Context) {
-		if err := traceExp.Shutdown(doneCtx); err != nil {
-			otel.Handle(err)
+	return func(doneCtx context.Context) { // Return a function to shutdown the trace exporter
+		if err := traceExp.Shutdown(doneCtx); err != nil { // Attempt to shutdown the trace exporter
+			otel.Handle(err) // Handle any errors that occur during shutdown
 		}
 	}
 }
 
-// handleErr provides a simple way to handle errors and messages
+// Simple error handling function that logs fatal errors
 func handleErr(err error, message string) {
 	if err != nil {
-		log.Fatalf("%s: %v", message, err)
+		log.Fatalf("%s: %v", message, err) // Log the error message and terminate the program
 	}
 }
 
-// continuouslySendRequests continuously sends requests to the server sleeping for a second after each request.
+// Continuously sends requests, creating a new span for each request
 func continuouslySendRequests() {
-	tracer := otel.Tracer("demo-client-tracer")
+	tracer := otel.Tracer("demo-client-tracer") // Retrieve a tracer with a specified name
 
-	for {
-		ctx, span := tracer.Start(context.Background(), "ExecuteRequest")
-		makeRequest(ctx)
-		SuccessfullyFinishedRequestEvent(span)
-		span.End()
-		time.Sleep(time.Duration(1) * time.Second)
+	for { // Infinite loop to continuously send requests
+		ctx, span := tracer.Start(context.Background(), "ExecuteRequest") // Start a new span for the request
+		makeRequest(ctx) // Send the request
+		SuccessfullyFinishedRequestEvent(span) // Record a custom event on the span
+		span.End() // End the span
+		time.Sleep(time.Duration(1) * time.Second) // Sleep for a second before sending the next request
 	}
 }
 
-// makeRequest sends requests to the server using an OTEL HTTP transport which will instrument the requests with traces.
+// Sends an HTTP request, instrumented to include tracing information
 func makeRequest(ctx context.Context) {
 
+	// Get server endpoint from environment variable or use default
 	demoServerAddr, ok := os.LookupEnv("DEMO_SERVER_ENDPOINT")
 	if !ok {
 		demoServerAddr = "http://0.0.0.0:7080/hello"
 	}
 
-	// Trace an HTTP client by wrapping the transport
-	client := http.Client{
-		Transport: otelhttp.NewTransport(http.DefaultTransport),
+	client := http.Client{ // Create a new HTTP client
+		Transport: otelhttp.NewTransport(http.DefaultTransport), // Wrap the default transport with OpenTelemetry instrumentation
 	}
 
-	// Make sure we pass the context to the request to avoid broken traces.
-	req, err := http.NewRequestWithContext(ctx, "GET", demoServerAddr, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", demoServerAddr, nil) // Create a new HTTP request with the provided context
 	if err != nil {
-		handleErr(err, "failed to http request")
+		handleErr(err, "failed to http request") // Handle any errors in creating the request
 	}
 
-	// All requests made with this client will create spans.
-	res, err := client.Do(req)
+	res, err := client.Do(req) // Send the request
 	if err != nil {
-		panic(err)
+		panic(err) // Panic if there is an error sending the request
 	}
-	res.Body.Close()
+	res.Body.Close() // Close the response body to avoid resource leaks
 }
 
-// SuccessfullyFinishedRequestEvent adds an event to the span which is analogous with a log statement, but is included
-// in the trace structure and provides more context than a log statement.
+// Records a custom event on the span to indicate successful request completion
 func SuccessfullyFinishedRequestEvent(span trace.Span, opts ...trace.EventOption) {
-	opts = append(opts, trace.WithAttributes(attribute.String("someKey", "someValue")))
-	span.AddEvent("successfully finished request operation", opts...)
+	opts = append(opts, trace.WithAttributes(attribute.String("someKey", "someValue"))) // Add custom attributes to the event
+	span.AddEvent("successfully finished request operation", opts...) // Add the custom event to the span
 }
 
-// WithCorrelation adds span and trace IDs to a zap logger to enable better correlation between traces and logs.
+// Enhances a zap logger with trace and span IDs for better correlation between logs and traces
 func WithCorrelation(span trace.Span, log *zap.Logger) *zap.Logger {
 	return log.With(
-		zap.String("span_id", convertTraceID(span.SpanContext().SpanID().String())),
-		zap.String("trace_id", convertTraceID(span.SpanContext().TraceID().String())),
+		zap.String("span_id", convertTraceID(span.SpanContext().SpanID().String())), // Add the span ID to the log
+		zap.String("trace_id", convertTraceID(span.SpanContext().TraceID().String())), // Add the trace ID to the log
 	)
 }
 
+// Converts a trace ID from hexadecimal to decimal format
 func convertTraceID(id string) string {
-	if len(id) < 16 {
-		return ""
+	if len(id) < 16 { // Check if the ID is shorter than expected
+		return "" // Return an empty string if the ID is invalid
 	}
-	if len(id) > 16 {
-		id = id[16:]
+	if len(id) > 16 { // If the ID is longer than 16 characters
+		id = id[16:] // Use the last 16 characters
 	}
-	intValue, err := strconv.ParseUint(id, 16, 64)
+	intValue, err := strconv.ParseUint(id, 16, 64) // Convert the hexadecimal string to a uint64
 	if err != nil {
-		return ""
+		return "" // Return an empty string if there is a conversion error
 	}
-	return strconv.FormatUint(intValue, 10)
+	return strconv.FormatUint(intValue, 10) // Convert the uint64 value to a decimal string
 }
